@@ -20,7 +20,12 @@ from rest_framework.response import Response
 from rest_framework import status
 from django.db.models import Q
 from .models import Product
+import telegram
+from django.conf import settings
+import logging
 
+
+logger = logging.getLogger(__name__)
 
 class IsAdminUser(BasePermission):
     def has_permission(self, request, view):
@@ -53,7 +58,7 @@ class ProductFilter(django_filters.FilterSet):
     category = django_filters.NumberFilter(field_name="category__id")
     wood_type = django_filters.CharFilter(field_name="wood_type__name")
     grade = django_filters.CharFilter(field_name="grade__name")
-    search = django_filters.CharFilter(method='filter_search')  # Добавлен поиск
+    search = django_filters.CharFilter(method='filter_search')
     ordering = django_filters.OrderingFilter(
         fields=(
             ('name', 'name'),
@@ -180,8 +185,64 @@ class OrderFilter(django_filters.FilterSet):
             Q(phone_number__icontains=value)
         )
 
+def send_telegram_notification(order):
+    """Отправка уведомления о заказе в Telegram"""
+    try:
+        bot = telegram.Bot(token=settings.TELEGRAM_BOT_TOKEN)
+        
+        # Формируем список товаров
+        items_list = ""
+        for item in order.items.all():
+            items_list += f"\n• {item.product.name} - {item.quantity} шт. x {item.price} руб. = {item.quantity * item.price} руб."
+        
+        # Словарь для преобразования payment_method в читаемый вид
+        PAYMENT_METHODS_DISPLAY = {
+            'cash': 'Наличными',
+            'transfer': 'Переводом',
+            # добавьте другие методы оплаты, если есть
+        }
+        
+        payment_method_display = PAYMENT_METHODS_DISPLAY.get(
+            order.payment_method, 
+            order.payment_method
+        )
+        
+        # Формируем сообщение
+        message = f"""
+🆕 <b>НОВЫЙ ЗАКАЗ #{order.id}</b>
+
+👤 <b>Клиент:</b>
+👤 Логин: {order.user.username}
+📞 Телефон: {order.phone_number}
+📍 Адрес: {order.address}
+
+📦 <b>Доставка:</b>
+📅 Дата: {order.delivery_date.strftime('%d.%m.%Y')}
+⏰ Время: {order.delivery_time_interval}
+💳 Оплата: {payment_method_display}
+
+💰 <b>ИТОГО: {order.total_price} руб.</b>
+
+🛒 <b>Товары:</b>{items_list}
+"""
+        
+        # Отправляем сообщение
+        result = bot.send_message(
+            chat_id=settings.TELEGRAM_ADMIN_CHAT_ID,
+            text=message,
+            parse_mode='HTML'
+        )
+        
+        logger.info(f"✅ Telegram notification sent for order #{order.id}, message ID: {result.message_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to send Telegram notification: {e}")
+        print(f"❌ Ошибка отправки в Telegram: {e}")  # Для отладки
+        return False
+
 class OrderViewSet(viewsets.ModelViewSet):
-    queryset = Order.objects.none()  # По умолчанию — пустой список
+    queryset = Order.objects.none()
     serializer_class = OrderSerializer
     permission_classes = [IsAuthenticated]
     filter_backends = [django_filters.DjangoFilterBackend]
@@ -215,8 +276,32 @@ class OrderViewSet(viewsets.ModelViewSet):
         
         # Разрешаем обновлять только статус для PATCH запросов
         if request.method == 'PATCH' and 'status' in request.data:
+            old_status = instance.status
             instance.status = request.data['status']
             instance.save()
+            
+            # Отправляем уведомление об изменении статуса
+            if old_status != instance.status:
+                try:
+                    bot = telegram.Bot(token=settings.TELEGRAM_BOT_TOKEN)
+                    message = f"""
+ℹ️ <b>Статус заказа #{instance.id} изменен</b>
+
+Старый статус: {old_status}
+Новый статус: {instance.status}
+
+👤 Клиент: {instance.user.username}
+📞 Телефон: {instance.phone_number}
+💰 Сумма: {instance.total_price} руб.
+"""
+                    bot.send_message(
+                        chat_id=settings.TELEGRAM_ADMIN_CHAT_ID,
+                        text=message,
+                        parse_mode='HTML'
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send status update notification: {e}")
+            
             serializer = self.get_serializer(instance)
             return Response(serializer.data)
             
@@ -237,7 +322,6 @@ class OrderViewSet(viewsets.ModelViewSet):
         kwargs['partial'] = True
         return self.update(request, *args, **kwargs)
 
-    # Остальные методы остаются без изменений
     def create(self, request, *args, **kwargs):
         try:
             with transaction.atomic():
@@ -281,7 +365,18 @@ class OrderViewSet(viewsets.ModelViewSet):
                     ) for item in order_items_data
                 ])
 
+                # Отправляем уведомление в Telegram
+                try:
+                    # Обновляем order с prefetch_related для items
+                    order = Order.objects.prefetch_related(
+                        'items__product'
+                    ).get(id=order.id)
+                    send_telegram_notification(order)
+                except Exception as e:
+                    logger.error(f"Failed to send Telegram notification for order #{order.id}: {e}")
+
                 cart.items.all().delete()
+                
                 serializer = self.get_serializer(order)
                 return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -291,6 +386,7 @@ class OrderViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
         except Exception as e:
+            logger.error(f"Error creating order: {e}")
             return Response(
                 {'error': f'Ошибка при создании заказа: {str(e)}'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -300,47 +396,38 @@ class OrderItemViewSet(viewsets.ModelViewSet):
     queryset = OrderItem.objects.all()
     serializer_class = OrderItemSerializer
 
-# class RecommendationView(APIView):
-#     def post(self, request):
-#         answers = request.data.get('answers', [])
-        
-#         # Формируем Q-объекты для фильтрации
-#         q_objects = Q()
-#         price_min = Decimal('0.00')
-#         price_max = None  # Будем использовать None вместо float('inf')
-        
-#         for answer in answers:
-#             # Обработка тегов
-#             if 'tags' in answer:
-#                 for tag in answer['tags']:
-#                     q_objects |= Q(name__icontains=tag) | Q(description__icontains=tag)
-            
-#             # Обработка ценового диапазона
-#             if 'minPrice' in answer or 'maxPrice' in answer:
-#                 min_price = answer.get('minPrice')
-#                 max_price = answer.get('maxPrice')
-                
-#                 if min_price is not None:
-#                     price_min = max(price_min, Decimal(str(min_price)))
-#                 if max_price is not None:
-#                     if price_max is None:
-#                         price_max = Decimal(str(max_price))
-#                     else:
-#                         price_max = min(price_max, Decimal(str(max_price)))
-        
-#         # Строим фильтр для цены
-#         price_filter = Q(price__gte=price_min)
-#         if price_max is not None:
-#             price_filter &= Q(price__lte=price_max)
-        
-#         # Применяем фильтры
-#         products = Product.objects.filter(
-#             q_objects & price_filter
-#         ).order_by('price')[:6]  # Лимит 6 товаров
-        
-#         serializer = ProductSerializer(products, many=True)
-#         return Response(serializer.data, status=status.HTTP_200_OK)
+class TelegramNotificationView(APIView):
+    """Отдельный view для отправки уведомлений в Telegram"""
+    permission_classes = [IsAuthenticated]
 
+    def post(self, request):
+        try:
+            order_id = request.data.get('order_id')
+            order = Order.objects.prefetch_related(
+                'items__product'
+            ).get(id=order_id)
+            
+            success = send_telegram_notification(order)
+            
+            if success:
+                return Response({'status': 'ok', 'message': 'Уведомление отправлено'})
+            else:
+                return Response(
+                    {'error': 'Не удалось отправить уведомление в Telegram'}, 
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+                
+        except Order.DoesNotExist:
+            return Response(
+                {'error': 'Заказ не найден'}, 
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            logger.error(f"Telegram notification error: {e}")
+            return Response(
+                {'error': str(e)}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
 class RecommendationView(APIView):
     def post(self, request):
@@ -444,7 +531,7 @@ class RecommendationView(APIView):
             else:
                 match_percent = 0
             
-            if match_percent > 0:  # Показываем только товары с >40% соответствия
+            if match_percent > 0:
                 results.append({
                     'product': product,
                     'match_percent': match_percent,
@@ -498,7 +585,6 @@ class RegisterView(APIView):
             email=email,
         )
 
-        # Добавьте этот блок для возврата токенов
         refresh = RefreshToken.for_user(user)
         return Response({
             'message': 'Пользователь успешно зарегистрирован',
