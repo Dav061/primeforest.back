@@ -28,8 +28,8 @@ DEBUG = True  # Меняем на False для продакшена
 ALLOWED_HOSTS = ['*']
 
 # Только эти 2 строки для Nginx
-USE_X_FORWARDED_HOST = True
-SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+# USE_X_FORWARDED_HOST = True
+# SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 # Application definition
 INSTALLED_APPS = [
