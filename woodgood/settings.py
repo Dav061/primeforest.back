@@ -27,6 +27,9 @@ DEBUG = True  # Меняем на False для продакшена
 # ]
 ALLOWED_HOSTS = ['*']
 
+TELEGRAM_BOT_TOKEN = '8204536620:AAEk0Zr9R8FdckL-Ol2IzXQfXFCF_VoC_b8'
+TELEGRAM_ADMIN_CHAT_ID = '521194087'  # Узнайте у @userinfobot
+
 # Только эти 2 строки для Nginx
 # USE_X_FORWARDED_HOST = True
 # SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
@@ -128,27 +131,27 @@ TEMPLATES = [
 WSGI_APPLICATION = 'woodgood.wsgi.application'
 
 # # Настройки базы данных
-# DATABASES = {
-#     'default': {
-#         'ENGINE': 'django.db.backends.postgresql',
-#         'NAME': 'woodgood',
-#         'USER': 'postgres',
-#         'PASSWORD': 'postgres',
-#         'HOST': 'localhost',
-#         'PORT': '5432',
-#     }
-# }
-# Настройки базы данных для Docker
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
-        'NAME': os.getenv('DB_NAME', 'primeforest_db'),
-        'USER': os.getenv('DB_USER', 'primeforest_user'),
-        'PASSWORD': os.getenv('DB_PASSWORD', 'StrongPassword123!'),
-        'HOST': os.getenv('DB_HOST', 'postgres'),  # Имя контейнера, не localhost!
-        'PORT': os.getenv('DB_PORT', '5432'),
+        'NAME': 'woodgood',
+        'USER': 'postgres',
+        'PASSWORD': 'postgres',
+        'HOST': 'localhost',
+        'PORT': '5432',
     }
 }
+# Настройки базы данных для Docker
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.postgresql',
+#         'NAME': os.getenv('DB_NAME', 'primeforest_db'),
+#         'USER': os.getenv('DB_USER', 'primeforest_user'),
+#         'PASSWORD': os.getenv('DB_PASSWORD', 'StrongPassword123!'),
+#         'HOST': os.getenv('DB_HOST', 'postgres'),  # Имя контейнера, не localhost!
+#         'PORT': os.getenv('DB_PORT', '5432'),
+#     }
+# }
 
 
 # Модель пользователя

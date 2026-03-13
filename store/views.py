@@ -236,12 +236,6 @@ def send_telegram_notification(order):
         logger.error(f"❌ Failed to send Telegram notification: {e}")
         return False
 
-# store/views.py - ПОЛНОСТЬЮ ИСПРАВЛЕННЫЙ OrderViewSet
-
-# store/views.py - полностью исправленный OrderViewSet
-
-# store/views.py - полностью исправленный OrderViewSet
-
 class OrderViewSet(viewsets.ModelViewSet):
     queryset = Order.objects.none()
     serializer_class = OrderSerializer
@@ -460,9 +454,6 @@ class OrderItemViewSet(viewsets.ModelViewSet):
 
 
 # ========== АВТОРИЗАЦИЯ С ПРИВЯЗКОЙ ЗАКАЗОВ (ОБНОВЛЕННАЯ) ==========
-# store/views.py - добавим отладку в RegisterView
-
-# store/views.py - исправленный RegisterView
 
 class RegisterView(APIView):
     permission_classes = [AllowAny]
@@ -472,8 +463,6 @@ class RegisterView(APIView):
         password = request.data.get("password")
         email = request.data.get("email", "")
         
-        # ВАЖНО: Используем session_key из текущей сессии Django
-        # А не из request.data
         session_key = request.session.session_key
         
         print(f"Register attempt - username: {username}, Django session_key: {session_key}")
