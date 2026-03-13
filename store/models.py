@@ -1,3 +1,4 @@
+# store/models.py
 from decimal import Decimal
 from django.db import models
 from django.contrib.auth.models import AbstractUser
@@ -19,7 +20,7 @@ class User(AbstractUser):
 # Модель категории
 class Category(models.Model):
     name = models.CharField(max_length=100)
-    image_url = models.URLField(blank=True, null=True)  # Поле для изображения
+    image_url = models.URLField(blank=True, null=True)
     parent = models.ForeignKey('self', on_delete=models.CASCADE, null=True, blank=True, related_name='children')
 
     def __str__(self):
@@ -62,6 +63,11 @@ class Product(models.Model):
     category = models.ForeignKey(Category, on_delete=models.CASCADE, related_name='products', verbose_name="Категория")
     wood_type = models.ForeignKey(WoodType, on_delete=models.SET_NULL, null=True, blank=True, verbose_name="Порода дерева")
     grade = models.ForeignKey(Grade, on_delete=models.SET_NULL, null=True, blank=True, verbose_name="Сорт")
+    
+    width = models.IntegerField(null=True, blank=True, verbose_name="Ширина (мм)")
+    thickness = models.IntegerField(null=True, blank=True, verbose_name="Толщина (мм)")
+    length = models.IntegerField(null=True, blank=True, verbose_name="Длина (мм)")
+    
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
     updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
     is_active = models.BooleanField(default=True, verbose_name="Активный")
@@ -72,12 +78,9 @@ class Product(models.Model):
     class Meta:
         verbose_name = "Товар"
         verbose_name_plural = "Товары"
-        # Добавляем фильтр по умолчанию, чтобы неактивные товары не показывались
-        default_manager_name = 'objects'
     
-    # Добавляем менеджер, который по умолчанию показывает только активные товары
     objects = models.Manager()
-    all_objects = models.Manager()  # Для доступа ко всем товарам, включая неактивные
+    all_objects = models.Manager()
 
 
 # Модель изображения товара
@@ -93,7 +96,7 @@ class ProductImage(models.Model):
         verbose_name_plural = "Изображения товаров"
 
 
-# Модель корзины
+# Модель корзины (для авторизованных)
 class Cart(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='cart', verbose_name="Пользователь")
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
@@ -121,60 +124,81 @@ class CartItem(models.Model):
         verbose_name_plural = "Элементы корзины"
 
 
-# Модель заказа
+# Модель заказа (ОБНОВЛЕННАЯ)
 class Order(models.Model):
     STATUS_CHOICES = [
-        ('in_process', 'В процессе'),
+        ('in_process', 'В обработке'),
+        ('in_working', 'В работе'),
         ('completed', 'Завершен'),
         ('canceled', 'Отменен'),
     ]
     
-    TIME_INTERVAL_CHOICES = [
-        ('9-12', '9:00 - 12:00'),
-        ('12-15', '12:00 - 15:00'),
-        ('15-18', '15:00 - 18:00'),
-        ('18-21', '18:00 - 21:00'),
-    ]
+    # ОБНОВЛЕНО: user теперь необязательный
+    user = models.ForeignKey(
+        User, 
+        on_delete=models.CASCADE, 
+        related_name='orders', 
+        verbose_name="Пользователь",
+        null=True,
+        blank=True
+    )
     
-    PAYMENT_METHOD_CHOICES = [
-        ('cash', 'Наличными при получении'),
-        ('transfer', 'Переводом при получении'),
-    ]
-    
-    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='orders', verbose_name="Пользователь")
     total_price = models.DecimalField(
         max_digits=10, 
         decimal_places=2,
         validators=[MinValueValidator(Decimal('0.00'))],
-        null=False,  # Важно: поле не может быть NULL
+        null=False,
         blank=False
     )
     address = models.TextField(verbose_name="Адрес доставки")
-    phone_number = models.CharField(max_length=20, verbose_name="Номер телефона", blank=True, null=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='in_process', verbose_name="Статус заказа")
-    delivery_date = models.DateField(verbose_name="Дата доставки", null=True, blank=True)
-    delivery_time_interval = models.CharField(
-        max_length=20, 
-        choices=TIME_INTERVAL_CHOICES, 
-        verbose_name="Временной интервал доставки",
+    phone_number = models.CharField(max_length=15, blank=True, null=True, verbose_name="Номер телефона")
+
+    
+    # НОВОЕ: комментарий к заказу
+    comment = models.TextField(
+        verbose_name="Комментарий к заказу",
+        blank=True,
         null=True,
-        blank=True
+        help_text="Дополнительная информация по заказу"
     )
-    payment_method = models.CharField(
-        max_length=20,
-        choices=PAYMENT_METHOD_CHOICES,
-        default='cash',
-        verbose_name="Способ оплаты"
+    
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='in_process', verbose_name="Статус заказа")
+    
+    
+    # НОВЫЕ ПОЛЯ для гостей
+    guest_email = models.EmailField(
+        verbose_name="Email гостя",
+        max_length=254,
+        blank=True,
+        null=True
     )
+    guest_name = models.CharField(
+        verbose_name="Имя гостя",
+        max_length=150,
+        blank=True,
+        null=True
+    )
+    
+    # Сессия для идентификации гостя
+    session_key = models.CharField(
+        max_length=40,
+        blank=True,
+        null=True,
+        db_index=True
+    )
+    
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
     updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
 
     def __str__(self):
-        return f"Заказ {self.id} от {self.user.username}"
+        if self.user:
+            return f"Заказ {self.id} от {self.user.username}"
+        return f"Заказ {self.id} (гость: {self.guest_name or 'неизвестный'})"
 
     class Meta:
         verbose_name = "Заказ"
         verbose_name_plural = "Заказы"
+
 
 # Модель элемента заказа
 class OrderItem(models.Model):

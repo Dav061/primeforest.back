@@ -1,8 +1,10 @@
+# store/serializers.py
 from decimal import Decimal
 from rest_framework import serializers
 from .models import Category, Product, ProductImage, WoodType, Grade, Cart, CartItem, Order, OrderItem, Recommendation
-from django.contrib.auth.models import User
-from store.models import User
+from django.contrib.auth import get_user_model
+
+User = get_user_model()
 
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
@@ -40,7 +42,11 @@ class ProductSerializer(serializers.ModelSerializer):
     grade = serializers.CharField(source='grade.name', read_only=True)
     main_image = serializers.SerializerMethodField()
     
-    # Поля для записи - принимаем строковые значения
+    width = serializers.IntegerField(required=False, allow_null=True)
+    thickness = serializers.IntegerField(required=False, allow_null=True)
+    length = serializers.IntegerField(required=False, allow_null=True)
+    
+    # Поля для записи
     category_name = serializers.CharField(
         write_only=True,
         required=False,
@@ -69,6 +75,7 @@ class ProductSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'description', 'price', 'is_active',
             'category', 'wood_type', 'grade',
+            'width', 'thickness', 'length',
             'category_name', 'wood_type_name', 'grade_name',
             'main_image', 'image_url'
         ]
@@ -78,7 +85,6 @@ class ProductSerializer(serializers.ModelSerializer):
         return first_image.image_url if first_image else None
 
     def validate(self, data):
-        """Валидация и преобразование строковых значений в объекты"""
         if 'category_name' in data and data['category_name']:
             try:
                 data['category'] = Category.objects.get(name=data.pop('category_name'))
@@ -145,19 +151,29 @@ class OrderItemSerializer(serializers.ModelSerializer):
         fields = ['id', 'product', 'quantity', 'price']
         read_only_fields = ['id', 'price']
 
+# store/serializers.py - исправленный OrderSerializer
+
+# store/serializers.py - исправленный OrderSerializer
+
 class OrderSerializer(serializers.ModelSerializer):
     items = OrderItemSerializer(many=True, read_only=True)
     user = UserSerializer(read_only=True)
-    # user = serializers.PrimaryKeyRelatedField(read_only=True)
     
     class Meta:
         model = Order
         fields = [
             'id', 'user', 'total_price', 'address', 'phone_number',
-            'status', 'delivery_date', 'delivery_time_interval',
-            'payment_method', 'created_at', 'updated_at', 'items'
+            'status', 'created_at', 'updated_at', 'items',
+            'guest_email', 'guest_name', 'comment'
         ]
-        read_only_fields = fields  # Все поля только для чтения
+        read_only_fields = ['id', 'user', 'created_at', 'updated_at', 'status', 'total_price']
+        extra_kwargs = {
+            'address': {'required': True},
+            'phone_number': {'required': True},
+            'guest_name': {'required': False},
+            'guest_email': {'required': False},
+            'comment': {'required': False}
+        }
 
 class RecommendationSerializer(serializers.ModelSerializer):
     class Meta:

@@ -1,30 +1,28 @@
+# store/views.py
 from decimal import Decimal
 from django.db import transaction
 from rest_framework import viewsets, status
 from rest_framework.response import Response
 from rest_framework.decorators import action
-from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.permissions import IsAuthenticated, AllowAny, BasePermission
 from rest_framework.views import APIView
 from django.contrib.auth.hashers import make_password
-from django.contrib.auth import authenticate
+from django.contrib.auth import authenticate, get_user_model
 from rest_framework_simplejwt.tokens import RefreshToken
 from django_filters import rest_framework as django_filters
-from .models import Category, Product, ProductImage, WoodType, Grade, Cart, CartItem, Order, OrderItem, Recommendation
-from .serializers import CategorySerializer, ProductSerializer, ProductImageSerializer, WoodTypeSerializer, GradeSerializer, CartSerializer, CartItemSerializer, OrderSerializer, OrderItemSerializer, RecommendationSerializer, UserSerializer
-from django.contrib.auth.models import User
-from store.models import User
-from rest_framework.permissions import IsAuthenticated, BasePermission
-from rest_framework.response import Response
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
 from django.db.models import Q
-from .models import Product
-import telegram
 from django.conf import settings
+import telegram
 import logging
 
+from .models import Category, Product, ProductImage, WoodType, Grade, Cart, CartItem, Order, OrderItem
+from .serializers import (
+    CategorySerializer, ProductSerializer, ProductImageSerializer,
+    WoodTypeSerializer, GradeSerializer, CartSerializer, CartItemSerializer,
+    OrderSerializer, OrderItemSerializer, UserSerializer
+)
 
+User = get_user_model()
 logger = logging.getLogger(__name__)
 
 class IsAdminUser(BasePermission):
@@ -47,10 +45,12 @@ class CategoryViewSet(viewsets.ModelViewSet):
 class WoodTypeViewSet(viewsets.ModelViewSet):
     queryset = WoodType.objects.all()
     serializer_class = WoodTypeSerializer
+    permission_classes = [AllowAny]
 
 class GradeViewSet(viewsets.ModelViewSet):
     queryset = Grade.objects.all()
     serializer_class = GradeSerializer
+    permission_classes = [AllowAny]
 
 class ProductFilter(django_filters.FilterSet):
     min_price = django_filters.NumberFilter(field_name="price", lookup_expr='gte')
@@ -58,6 +58,9 @@ class ProductFilter(django_filters.FilterSet):
     category = django_filters.NumberFilter(field_name="category__id")
     wood_type = django_filters.CharFilter(field_name="wood_type__name")
     grade = django_filters.CharFilter(field_name="grade__name")
+    width = django_filters.NumberFilter(field_name="width")
+    thickness = django_filters.NumberFilter(field_name="thickness")
+    length = django_filters.NumberFilter(field_name="length")
     search = django_filters.CharFilter(method='filter_search')
     ordering = django_filters.OrderingFilter(
         fields=(
@@ -69,7 +72,7 @@ class ProductFilter(django_filters.FilterSet):
 
     class Meta:
         model = Product
-        fields = ['category', 'wood_type', 'grade', 'min_price', 'max_price', 'is_active']
+        fields = ['category', 'wood_type', 'grade', 'width', 'thickness', 'length', 'min_price', 'max_price', 'is_active']
 
     def filter_search(self, queryset, name, value):
         return queryset.filter(name__icontains=value)
@@ -84,7 +87,6 @@ class ProductViewSet(viewsets.ModelViewSet):
     def destroy(self, request, *args, **kwargs):
         product = self.get_object()
         
-        # Проверяем, есть ли этот товар в активных заказах (статус 'in_process')
         active_order_items = OrderItem.objects.filter(
             product=product,
             order__status='in_process'
@@ -97,7 +99,6 @@ class ProductViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Если товар есть только в завершенных/отмененных заказах, помечаем его как неактивный вместо удаления
         product.is_active = False
         product.save()
         
@@ -114,7 +115,10 @@ class ProductViewSet(viewsets.ModelViewSet):
 class ProductImageViewSet(viewsets.ModelViewSet):
     queryset = ProductImage.objects.all()
     serializer_class = ProductImageSerializer
+    permission_classes = [AllowAny]
 
+
+# ========== КОРЗИНА ==========
 class CartViewSet(viewsets.ModelViewSet):
     queryset = Cart.objects.all()
     serializer_class = CartSerializer
@@ -131,9 +135,8 @@ class CartViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['delete'])
     def clear(self, request):
-        user = request.user
         try:
-            cart = Cart.objects.get(user=user)
+            cart = Cart.objects.get(user=request.user)
             cart.items.all().delete()
             return Response({'status': 'Корзина очищена'}, status=status.HTTP_200_OK)
         except Cart.DoesNotExist:
@@ -147,9 +150,12 @@ class CartViewSet(viewsets.ModelViewSet):
 
         if not product_id:
             return Response({'error': 'product_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        if quantity <= 0:
+            return Response({'error': 'Количество должно быть больше 0'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            product = Product.objects.get(id=product_id)
+            product = Product.objects.get(id=product_id, is_active=True)
         except Product.DoesNotExist:
             return Response({'error': 'Товар не найден'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -167,7 +173,10 @@ class CartViewSet(viewsets.ModelViewSet):
 class CartItemViewSet(viewsets.ModelViewSet):
     queryset = CartItem.objects.all()
     serializer_class = CartItemSerializer
+    permission_classes = [IsAuthenticated]
 
+
+# ========== ЗАКАЗЫ (ОБНОВЛЕННЫЕ) ==========
 class OrderFilter(django_filters.FilterSet):
     status = django_filters.CharFilter(field_name='status')
     user = django_filters.NumberFilter(field_name='user__id')
@@ -178,55 +187,42 @@ class OrderFilter(django_filters.FilterSet):
         fields = ['status', 'user']
     
     def filter_search(self, queryset, name, value):
-        # Поиск по ID заказа или имени пользователя
         return queryset.filter(
             Q(id__icontains=value) | 
             Q(user__username__icontains=value) |
-            Q(phone_number__icontains=value)
+            Q(phone_number__icontains=value) |
+            Q(guest_name__icontains=value) |
+            Q(guest_email__icontains=value)
         )
 
 def send_telegram_notification(order):
-    """Отправка уведомления о заказе в Telegram"""
     try:
         bot = telegram.Bot(token=settings.TELEGRAM_BOT_TOKEN)
         
-        # Формируем список товаров
         items_list = ""
         for item in order.items.all():
             items_list += f"\n• {item.product.name} - {item.quantity} шт. x {item.price} руб. = {item.quantity * item.price} руб."
         
-        # Словарь для преобразования payment_method в читаемый вид
-        PAYMENT_METHODS_DISPLAY = {
-            'cash': 'Наличными',
-            'transfer': 'Переводом',
-            # добавьте другие методы оплаты, если есть
-        }
         
-        payment_method_display = PAYMENT_METHODS_DISPLAY.get(
-            order.payment_method, 
-            order.payment_method
-        )
+        # Определяем тип клиента
+        client_info = f"👤 Клиент: {order.user.username if order.user else order.guest_name or 'Гость'}"
+        if order.guest_email:
+            client_info += f"\n📧 Email: {order.guest_email}"
         
-        # Формируем сообщение
+        comment_text = f"\n💬 Комментарий: {order.comment}" if order.comment else ""
+        
         message = f"""
 🆕 <b>НОВЫЙ ЗАКАЗ #{order.id}</b>
 
-👤 <b>Клиент:</b>
-👤 Логин: {order.user.username}
+{client_info}
 📞 Телефон: {order.phone_number}
-📍 Адрес: {order.address}
-
-📦 <b>Доставка:</b>
-📅 Дата: {order.delivery_date.strftime('%d.%m.%Y')}
-⏰ Время: {order.delivery_time_interval}
-💳 Оплата: {payment_method_display}
+📍 Адрес: {order.address}{comment_text}
 
 💰 <b>ИТОГО: {order.total_price} руб.</b>
 
 🛒 <b>Товары:</b>{items_list}
 """
         
-        # Отправляем сообщение
         result = bot.send_message(
             chat_id=settings.TELEGRAM_ADMIN_CHAT_ID,
             text=message,
@@ -238,59 +234,198 @@ def send_telegram_notification(order):
         
     except Exception as e:
         logger.error(f"❌ Failed to send Telegram notification: {e}")
-        print(f"❌ Ошибка отправки в Telegram: {e}")  # Для отладки
         return False
+
+# store/views.py - ПОЛНОСТЬЮ ИСПРАВЛЕННЫЙ OrderViewSet
+
+# store/views.py - полностью исправленный OrderViewSet
+
+# store/views.py - полностью исправленный OrderViewSet
 
 class OrderViewSet(viewsets.ModelViewSet):
     queryset = Order.objects.none()
     serializer_class = OrderSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
     filter_backends = [django_filters.DjangoFilterBackend]
     filterset_class = OrderFilter
 
     def get_queryset(self):
         user = self.request.user
-        queryset = Order.objects.all().select_related('user').prefetch_related(
-            'items',
-            'items__product',
-            'items__product__images'
+        
+        if user.is_authenticated:
+            queryset = Order.objects.filter(user=user)
+        else:
+            session_key = self.request.session.session_key
+            if session_key:
+                queryset = Order.objects.filter(session_key=session_key)
+            else:
+                queryset = Order.objects.none()
+        
+        if user.is_staff:
+            queryset = Order.objects.all()
+        
+        return queryset.select_related('user').prefetch_related(
+            'items', 'items__product', 'items__product__images'
         ).order_by('-created_at')
-        
-        # Применяем фильтры из URL-параметров
-        status = self.request.query_params.get('status', None)
-        user_id = self.request.query_params.get('user', None)
-        
-        if status:
-            queryset = queryset.filter(status=status)
-        if user_id:
-            queryset = queryset.filter(user__id=user_id)
-        
-        if not user.is_staff:
-            queryset = queryset.filter(user=user)
-            
-        return queryset
+
+    def create(self, request, *args, **kwargs):
+        try:
+            with transaction.atomic():
+                # Проверяем только обязательные поля
+                if not request.data.get('address'):
+                    return Response(
+                        {'error': 'Поле address (адрес доставки) обязательно для заполнения'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                
+                if not request.data.get('phone_number'):
+                    return Response(
+                        {'error': 'Поле phone_number (номер телефона) обязательно для заполнения'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+                # Для авторизованных пользователей
+                if request.user.is_authenticated:
+                    cart = Cart.objects.select_related('user').prefetch_related('items__product').get(user=request.user)
+                    
+                    if not cart.items.exists():
+                        return Response(
+                            {'error': 'Ваша корзина пуста'}, 
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+
+                    total_price = Decimal('0.00')
+                    order_items_data = []
+                    
+                    for cart_item in cart.items.all():
+                        item_price = Decimal(str(cart_item.product.price))
+                        total_price += item_price * cart_item.quantity
+                        order_items_data.append({
+                            'product': cart_item.product,
+                            'quantity': cart_item.quantity,
+                            'price': item_price
+                        })
+
+                    # Создание заказа для авторизованного - только нужные поля
+                    order = Order.objects.create(
+                        user=request.user,
+                        address=request.data.get('address'),
+                        phone_number=request.data.get('phone_number'),
+                        comment=request.data.get('comment', ''),
+                        status='in_process',
+                        total_price=total_price
+                    )
+
+                # Для гостей
+                else:
+                    # Получаем или создаем session_key
+                    if not request.session.session_key:
+                        request.session.create()
+                    
+                    session_key = request.session.session_key
+
+                    # Получаем товары из корзины
+                    cart_items = request.data.get('cart_items', [])
+                    
+                    if not cart_items:
+                        return Response(
+                            {'error': 'Корзина пуста'}, 
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+
+                    total_price = Decimal('0.00')
+                    order_items_data = []
+                    
+                    for item in cart_items:
+                        try:
+                            product = Product.objects.get(id=item['product_id'], is_active=True)
+                            quantity = int(item['quantity'])
+                            
+                            if quantity <= 0:
+                                raise ValueError("Количество должно быть положительным")
+                            
+                            item_price = Decimal(str(product.price))
+                            total_price += item_price * quantity
+                            
+                            order_items_data.append({
+                                'product': product,
+                                'quantity': quantity,
+                                'price': item_price
+                            })
+                        except (Product.DoesNotExist, ValueError, KeyError) as e:
+                            return Response(
+                                {'error': f'Ошибка в данных корзины: {str(e)}'}, 
+                                status=status.HTTP_400_BAD_REQUEST
+                            )
+
+                    # Создание заказа для гостя - только нужные поля
+                    order = Order.objects.create(
+                        session_key=session_key,
+                        guest_name=request.data.get('guest_name', 'Гость'),
+                        guest_email=request.data.get('guest_email'),
+                        address=request.data.get('address'),
+                        phone_number=request.data.get('phone_number'),
+                        comment=request.data.get('comment', ''),
+                        status='in_process',
+                        total_price=total_price
+                    )
+
+                # Создаем элементы заказа
+                OrderItem.objects.bulk_create([
+                    OrderItem(
+                        order=order,
+                        product=item['product'],
+                        quantity=item['quantity'],
+                        price=item['price']
+                    ) for item in order_items_data
+                ])
+
+                # Отправляем уведомление в Telegram
+                try:
+                    order_with_items = Order.objects.prefetch_related('items__product').get(id=order.id)
+                    send_telegram_notification(order_with_items)
+                except Exception as e:
+                    logger.error(f"Failed to send Telegram notification for order #{order.id}: {e}")
+
+                # Очищаем корзину для авторизованных
+                if request.user.is_authenticated:
+                    cart.items.all().delete()
+                
+                serializer = self.get_serializer(order)
+                return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+        except Cart.DoesNotExist:
+            return Response(
+                {'error': 'Корзина не найдена'}, 
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            logger.error(f"Error creating order: {e}")
+            return Response(
+                {'error': f'Ошибка при создании заказа: {str(e)}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
     def update(self, request, *args, **kwargs):
         partial = kwargs.pop('partial', False)
         instance = self.get_object()
         
-        # Разрешаем обновлять только статус для PATCH запросов
         if request.method == 'PATCH' and 'status' in request.data:
             old_status = instance.status
             instance.status = request.data['status']
             instance.save()
             
-            # Отправляем уведомление об изменении статуса
             if old_status != instance.status:
                 try:
                     bot = telegram.Bot(token=settings.TELEGRAM_BOT_TOKEN)
+                    client_info = f"{instance.user.username if instance.user else instance.guest_name or 'Гость'}"
                     message = f"""
 ℹ️ <b>Статус заказа #{instance.id} изменен</b>
 
 Старый статус: {old_status}
 Новый статус: {instance.status}
 
-👤 Клиент: {instance.user.username}
+👤 Клиент: {client_info}
 📞 Телефон: {instance.phone_number}
 💰 Сумма: {instance.total_price} руб.
 """
@@ -318,94 +453,128 @@ class OrderViewSet(viewsets.ModelViewSet):
 
         return Response(serializer.data)
 
-    def partial_update(self, request, *args, **kwargs):
-        kwargs['partial'] = True
-        return self.update(request, *args, **kwargs)
-
-    def create(self, request, *args, **kwargs):
-        try:
-            with transaction.atomic():
-                cart = Cart.objects.select_related('user').prefetch_related('items__product').get(user=request.user)
-                
-                if not cart.items.exists():
-                    return Response(
-                        {'error': 'Ваша корзина пуста'}, 
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-
-                total_price = Decimal('0.00')
-                order_items_data = []
-                
-                for cart_item in cart.items.all():
-                    item_price = Decimal(str(cart_item.product.price))
-                    total_price += item_price * cart_item.quantity
-                    order_items_data.append({
-                        'product': cart_item.product,
-                        'quantity': cart_item.quantity,
-                        'price': item_price
-                    })
-
-                order = Order.objects.create(
-                    user=request.user,
-                    address=request.data.get('address'),
-                    phone_number=request.data.get('phone_number'),
-                    delivery_date=request.data.get('delivery_date'),
-                    delivery_time_interval=request.data.get('delivery_time_interval'),
-                    payment_method=request.data.get('payment_method', 'cash'),
-                    status='in_process',
-                    total_price=total_price
-                )
-
-                OrderItem.objects.bulk_create([
-                    OrderItem(
-                        order=order,
-                        product=item['product'],
-                        quantity=item['quantity'],
-                        price=item['price']
-                    ) for item in order_items_data
-                ])
-
-                # Отправляем уведомление в Telegram
-                try:
-                    # Обновляем order с prefetch_related для items
-                    order = Order.objects.prefetch_related(
-                        'items__product'
-                    ).get(id=order.id)
-                    send_telegram_notification(order)
-                except Exception as e:
-                    logger.error(f"Failed to send Telegram notification for order #{order.id}: {e}")
-
-                cart.items.all().delete()
-                
-                serializer = self.get_serializer(order)
-                return Response(serializer.data, status=status.HTTP_201_CREATED)
-
-        except Cart.DoesNotExist:
-            return Response(
-                {'error': 'Корзина не найдена'}, 
-                status=status.HTTP_404_NOT_FOUND
-            )
-        except Exception as e:
-            logger.error(f"Error creating order: {e}")
-            return Response(
-                {'error': f'Ошибка при создании заказа: {str(e)}'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
 class OrderItemViewSet(viewsets.ModelViewSet):
     queryset = OrderItem.objects.all()
     serializer_class = OrderItemSerializer
+    permission_classes = [IsAuthenticated]
+
+
+# ========== АВТОРИЗАЦИЯ С ПРИВЯЗКОЙ ЗАКАЗОВ (ОБНОВЛЕННАЯ) ==========
+# store/views.py - добавим отладку в RegisterView
+
+# store/views.py - исправленный RegisterView
+
+class RegisterView(APIView):
+    permission_classes = [AllowAny]
+    
+    def post(self, request):
+        username = request.data.get("username")
+        password = request.data.get("password")
+        email = request.data.get("email", "")
+        
+        # ВАЖНО: Используем session_key из текущей сессии Django
+        # А не из request.data
+        session_key = request.session.session_key
+        
+        print(f"Register attempt - username: {username}, Django session_key: {session_key}")
+
+        if not username or not password:
+            return Response(
+                {"error": "Логин и пароль обязательны"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if User.objects.filter(username=username).exists():
+            return Response(
+                {"error": "Пользователь с таким логином уже существует"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            # Создаем пользователя
+            user = User.objects.create(
+                username=username,
+                password=make_password(password),
+                email=email,
+            )
+
+            # ПРИВЯЗКА ГОСТЕВЫХ ЗАКАЗОВ
+            linked_orders_count = 0
+            if session_key:
+                print(f"Looking for orders with Django session_key: {session_key}")
+                
+                # Находим все заказы с этой сессией
+                guest_orders = Order.objects.filter(session_key=session_key)
+                linked_orders_count = guest_orders.count()
+                
+                print(f"Found {linked_orders_count} guest orders")
+                
+                # Привязываем их к пользователю
+                for order in guest_orders:
+                    print(f"Linking order {order.id} to user {user.id}")
+                    order.user = user
+                    order.session_key = None
+                    order.save()
+                    
+                logger.info(f"Привязано {linked_orders_count} заказов к пользователю {user.username}")
+
+            # Создаем корзину для пользователя
+            Cart.objects.get_or_create(user=user)
+
+        refresh = RefreshToken.for_user(user)
+        
+        return Response({
+            'message': 'Пользователь успешно зарегистрирован',
+            'tokens': {
+                'refresh': str(refresh),
+                'access': str(refresh.access_token),
+            },
+            'user': UserSerializer(user).data,
+            'linked_orders_count': linked_orders_count
+        }, status=status.HTTP_201_CREATED)
+
+class LoginView(APIView):
+    permission_classes = [AllowAny]
+    
+    def post(self, request):
+        username = request.data.get('username')
+        password = request.data.get('password')
+
+        if not username or not password:
+            return Response(
+                {'error': 'Логин и пароль обязательны'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        user = authenticate(username=username, password=password)
+
+        if user:
+            refresh = RefreshToken.for_user(user)
+            
+            # Создаем корзину если её нет
+            Cart.objects.get_or_create(user=user)
+            
+            return Response({
+                'message': 'Успешный вход',
+                'tokens': {
+                    'refresh': str(refresh),
+                    'access': str(refresh.access_token),
+                },
+                'user': UserSerializer(user).data
+            }, status=status.HTTP_200_OK)
+            
+        return Response(
+            {'error': 'Неверный логин или пароль'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
 
 class TelegramNotificationView(APIView):
-    """Отдельный view для отправки уведомлений в Telegram"""
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
         try:
             order_id = request.data.get('order_id')
-            order = Order.objects.prefetch_related(
-                'items__product'
-            ).get(id=order_id)
+            order = Order.objects.prefetch_related('items__product').get(id=order_id)
             
             success = send_telegram_notification(order)
             
@@ -428,196 +597,3 @@ class TelegramNotificationView(APIView):
                 {'error': str(e)}, 
                 status=status.HTTP_400_BAD_REQUEST
             )
-
-class RecommendationView(APIView):
-    def post(self, request):
-        answers = request.data.get('answers', [])
-        
-        # Веса для разных типов вопросов (сумма = 100)
-        WEIGHTS = {
-            'application': 33,    # Область применения (самый важный)
-            'price': 26,          # Цена (высокий приоритет)
-            'wood_type': 18,      # Тип древесины
-            'processing': 12,      # Уровень обработки
-            'color': 11           # Цвет (наименее важный)
-        }
-        
-        # Собираем критерии с учетом весов
-        criteria = {
-            'application_tags': set(),
-            'wood_type_tags': set(),
-            'processing_tags': set(),
-            'color_tags': set(),
-            'price_min': Decimal('0.00'),
-            'price_max': None,
-            'total_weight': 0
-        }
-        
-        # Анализируем ответы пользователя
-        for answer in answers:
-            if 'tags' in answer:
-                # Определяем тип вопроса по содержанию тегов
-                if any(tag in ['крыша', 'кровля', 'пол', 'напольное', 'стены', 'обшивка', 'мебель', 'мебельный', 'декор', 'отделка', 'сад', 'ландшафт'] for tag in answer['tags']):
-                    criteria['application_tags'].update(answer['tags'])
-                    criteria['total_weight'] += WEIGHTS['application']
-                elif any(tag in ['сосна', 'ель', 'кедр', 'лиственница', 'дуб', 'ясень', 'берёза', 'бук', 'красное', 'тик', 'венге', 'мехагон', ''] for tag in answer['tags']):
-                    criteria['wood_type_tags'].update(answer['tags'])
-                    criteria['total_weight'] += WEIGHTS['wood_type']
-                elif any(tag in ['черновая', 'необработанная', 'шлифованная', 'стандарт', 'полированная', 'тонированная'] for tag in answer['tags']):
-                    criteria['processing_tags'].update(answer['tags'])
-                    criteria['total_weight'] += WEIGHTS['processing']
-                elif any(tag in ['светлый', 'белый', 'белёный', 'натуральный', 'древесный', 'тёмный', 'венге', 'орех', 'цветной', 'тонированный'] for tag in answer['tags']):
-                    criteria['color_tags'].update(answer['tags'])
-                    criteria['total_weight'] += WEIGHTS['color']
-            
-            # Обработка цены
-            if 'minPrice' in answer or 'maxPrice' in answer:
-                if 'minPrice' in answer and answer['minPrice'] is not None:
-                    criteria['price_min'] = max(
-                        criteria['price_min'],
-                        Decimal(str(answer['minPrice']))
-                    )
-                if 'maxPrice' in answer and answer['maxPrice'] is not None:
-                    if criteria['price_max'] is None:
-                        criteria['price_max'] = Decimal(str(answer['maxPrice']))
-                    else:
-                        criteria['price_max'] = min(
-                            criteria['price_max'],
-                            Decimal(str(answer['maxPrice']))
-                        )
-                criteria['total_weight'] += WEIGHTS['price']
-        
-        # Поиск и оценка товаров
-        products = Product.objects.all()
-        results = []
-        
-        for product in products:
-            score = 0
-            product_text = f"{product.name} {product.description or ''}".lower()
-            
-            # Проверка области применения (макс 30%)
-            if criteria['application_tags']:
-                if any(tag.lower() in product_text for tag in criteria['application_tags']):
-                    score += WEIGHTS['application']
-            
-            # Проверка цены (макс 25%)
-            price_passed = True
-            if product.price < criteria['price_min']:
-                price_passed = False
-            if criteria['price_max'] and product.price > criteria['price_max']:
-                price_passed = False
-            
-            if price_passed:
-                score += WEIGHTS['price']
-            
-            # Проверка типа древесины (макс 20%)
-            if criteria['wood_type_tags']:
-                if any(tag.lower() in product_text for tag in criteria['wood_type_tags']):
-                    score += WEIGHTS['wood_type']
-            
-            # Проверка обработки (макс 15%)
-            if criteria['processing_tags']:
-                if any(tag.lower() in product_text for tag in criteria['processing_tags']):
-                    score += WEIGHTS['processing']
-            
-            # Проверка цвета (макс 10%)
-            if criteria['color_tags']:
-                if any(tag.lower() in product_text for tag in criteria['color_tags']):
-                    score += WEIGHTS['color']
-            
-            # Расчет процента соответствия
-            if criteria['total_weight'] > 0:
-                match_percent = min(100, int((score / criteria['total_weight']) * 100))
-            else:
-                match_percent = 0
-            
-            if match_percent > 0:
-                results.append({
-                    'product': product,
-                    'match_percent': match_percent,
-                    'score_details': {
-                        'application': any(tag.lower() in product_text for tag in criteria['application_tags']),
-                        'price': price_passed,
-                        'wood_type': any(tag.lower() in product_text for tag in criteria['wood_type_tags']),
-                        'processing': any(tag.lower() in product_text for tag in criteria['processing_tags']),
-                        'color': any(tag.lower() in product_text for tag in criteria['color_tags'])
-                    }
-                })
-        
-        # Сортировка по убыванию соответствия
-        results.sort(key=lambda x: (-x['match_percent'], x['product'].price))
-        
-        # Формирование ответа
-        serialized_products = ProductSerializer(
-            [item['product'] for item in results[:6]],
-            many=True
-        ).data
-        
-        for i, item in enumerate(results[:6]):
-            serialized_products[i].update({
-                'match_percent': item['match_percent'],
-                'score_details': item['score_details']
-            })
-        
-        return Response(serialized_products, status=status.HTTP_200_OK)
-
-class RegisterView(APIView):
-    def post(self, request):
-        username = request.data.get("username")
-        password = request.data.get("password")
-        email = request.data.get("email", "")
-
-        if not username or not password:
-            return Response(
-                {"error": "Логин и пароль обязательны"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        if User.objects.filter(username=username).exists():
-            return Response(
-                {"error": "Пользователь с таким логином уже существует"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        user = User.objects.create(
-            username=username,
-            password=make_password(password),
-            email=email,
-        )
-
-        refresh = RefreshToken.for_user(user)
-        return Response({
-            'message': 'Пользователь успешно зарегистрирован',
-            'tokens': {
-                'refresh': str(refresh),
-                'access': str(refresh.access_token),
-            },
-            'user': UserSerializer(user).data
-        }, status=status.HTTP_201_CREATED)
-
-class LoginView(APIView):
-    def post(self, request):
-        username = request.data.get('username')
-        password = request.data.get('password')
-
-        if not username or not password:
-            return Response(
-                {'error': 'Логин и пароль обязательны'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        user = authenticate(username=username, password=password)
-
-        if user:
-            refresh = RefreshToken.for_user(user)
-            return Response({
-                'message': 'Успешный вход',
-                'tokens': {
-                    'refresh': str(refresh),
-                    'access': str(refresh.access_token),
-                }
-            }, status=status.HTTP_200_OK)
-        return Response(
-            {'error': 'Неверный логин или пароль'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
