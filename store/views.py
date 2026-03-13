@@ -195,16 +195,20 @@ class OrderFilter(django_filters.FilterSet):
             Q(guest_email__icontains=value)
         )
 
+import asyncio
+
 def send_telegram_notification(order):
     try:
+        # Создаем новый event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
         bot = telegram.Bot(token=settings.TELEGRAM_BOT_TOKEN)
         
         items_list = ""
         for item in order.items.all():
             items_list += f"\n• {item.product.name} - {item.quantity} шт. x {item.price} руб. = {item.quantity * item.price} руб."
         
-        
-        # Определяем тип клиента
         client_info = f"👤 Клиент: {order.user.username if order.user else order.guest_name or 'Гость'}"
         if order.guest_email:
             client_info += f"\n📧 Email: {order.guest_email}"
@@ -223,18 +227,23 @@ def send_telegram_notification(order):
 🛒 <b>Товары:</b>{items_list}
 """
         
-        result = bot.send_message(
-            chat_id=settings.TELEGRAM_ADMIN_CHAT_ID,
-            text=message,
-            parse_mode='HTML'
+        # Запускаем асинхронную функцию
+        loop.run_until_complete(
+            bot.send_message(
+                chat_id=settings.TELEGRAM_ADMIN_CHAT_ID,
+                text=message,
+                parse_mode='HTML'
+            )
         )
         
-        logger.info(f"✅ Telegram notification sent for order #{order.id}, message ID: {result.message_id}")
+        logger.info(f"✅ Telegram notification sent for order #{order.id}")
         return True
         
     except Exception as e:
         logger.error(f"❌ Failed to send Telegram notification: {e}")
         return False
+    finally:
+        loop.close()
 
 class OrderViewSet(viewsets.ModelViewSet):
     queryset = Order.objects.none()
