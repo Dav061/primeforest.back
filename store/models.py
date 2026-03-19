@@ -1,11 +1,11 @@
 # store/models.py
-from decimal import Decimal
 from django.db import models
 from django.contrib.auth.models import AbstractUser
 from django.core.validators import MinValueValidator
+from django.core.exceptions import ValidationError
 
 
-# Модель пользователя
+# Модель пользователя (без изменений)
 class User(AbstractUser):
     phone_number = models.CharField(max_length=15, blank=True, null=True, verbose_name="Номер телефона")
 
@@ -17,7 +17,7 @@ class User(AbstractUser):
         verbose_name_plural = "Пользователи"
 
 
-# Модель категории
+# Модель категории (без изменений)
 class Category(models.Model):
     name = models.CharField(max_length=100)
     image_url = models.URLField(blank=True, null=True)
@@ -31,7 +31,7 @@ class Category(models.Model):
         verbose_name_plural = "Категории"
 
 
-# Модель породы дерева
+# Модель породы дерева (без изменений)
 class WoodType(models.Model):
     name = models.CharField(max_length=100, verbose_name="Название породы")
 
@@ -43,7 +43,7 @@ class WoodType(models.Model):
         verbose_name_plural = "Породы дерева"
 
 
-# Модель сорта
+# Модель сорта (без изменений)
 class Grade(models.Model):
     name = models.CharField(max_length=100, verbose_name="Название сорта")
 
@@ -55,15 +55,85 @@ class Grade(models.Model):
         verbose_name_plural = "Сорта"
 
 
-# Модель товара
+# НОВАЯ МОДЕЛЬ: Тип единицы измерения
+class UnitType(models.Model):
+    """
+    Тип единицы измерения (штуки, кубы, квадраты, упаковки)
+    """
+    name = models.CharField(max_length=50, verbose_name="Название", unique=True)
+    code = models.CharField(max_length=20, verbose_name="Код", unique=True, 
+                           help_text="Например: piece, cubic, square, pack")
+    short_name = models.CharField(max_length=10, verbose_name="Краткое название", 
+                                 help_text="Например: шт, м³, м², уп")
+    
+    def __str__(self):
+        return f"{self.name} ({self.short_name})"
+    
+    class Meta:
+        verbose_name = "Тип единицы измерения"
+        verbose_name_plural = "Типы единиц измерения"
+
+
+# НОВАЯ МОДЕЛЬ: Вариант цены для товара
+class ProductPrice(models.Model):
+    """
+    Вариант цены для товара с указанием единицы измерения
+    Цена - целое число (IntegerField) без копеек
+    """
+    product = models.ForeignKey('Product', on_delete=models.CASCADE, 
+                               related_name='prices', verbose_name="Товар")
+    unit_type = models.ForeignKey(UnitType, on_delete=models.PROTECT, 
+                                 verbose_name="Тип единицы измерения")
+    
+    # Цена - целое число (рубли без копеек)
+    price = models.IntegerField(
+        validators=[MinValueValidator(0)], 
+        verbose_name="Цена (руб)",
+        help_text="Целое число, без копеек"
+    )
+    
+    # Опционально: количество в единице (для упаковок)
+    quantity_per_unit = models.PositiveIntegerField(
+        null=True, 
+        blank=True, 
+        verbose_name="Количество в единице",
+        help_text="Например: 6 досок в упаковке"
+    )
+    
+    is_default = models.BooleanField(default=False, verbose_name="По умолчанию")
+    
+    class Meta:
+        verbose_name = "Вариант цены"
+        verbose_name_plural = "Варианты цен"
+        # Один товар может иметь только одну цену каждого типа
+        unique_together = ['product', 'unit_type']
+    
+    def __str__(self):
+        return f"{self.product.name} - {self.unit_type.short_name}: {self.price} руб."
+    
+    def clean(self):
+        """Валидация для разных типов единиц"""
+        if self.unit_type.code in ['pack'] and not self.quantity_per_unit:
+            raise ValidationError({
+                'quantity_per_unit': 'Для упаковок необходимо указать количество в упаковке'
+            })
+
+
+# Модель товара (ОБНОВЛЕННАЯ)
 class Product(models.Model):
     name = models.CharField(max_length=255, db_index=True, verbose_name="Название товара")
     description = models.TextField(db_index=True, verbose_name="Описание")
-    price = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0)], db_index=True, verbose_name="Цена")
-    category = models.ForeignKey(Category, on_delete=models.CASCADE, related_name='products', verbose_name="Категория")
-    wood_type = models.ForeignKey(WoodType, on_delete=models.SET_NULL, null=True, blank=True, verbose_name="Порода дерева")
-    grade = models.ForeignKey(Grade, on_delete=models.SET_NULL, null=True, blank=True, verbose_name="Сорт")
     
+    # Удаляем старое поле price - теперь цены в ProductPrice
+    
+    category = models.ForeignKey(Category, on_delete=models.CASCADE, 
+                                related_name='products', verbose_name="Категория")
+    wood_type = models.ForeignKey(WoodType, on_delete=models.SET_NULL, 
+                                 null=True, blank=True, verbose_name="Порода дерева")
+    grade = models.ForeignKey(Grade, on_delete=models.SET_NULL, 
+                             null=True, blank=True, verbose_name="Сорт")
+    
+    # Размеры (для информации)
     width = models.IntegerField(null=True, blank=True, verbose_name="Ширина (мм)")
     thickness = models.IntegerField(null=True, blank=True, verbose_name="Толщина (мм)")
     length = models.IntegerField(null=True, blank=True, verbose_name="Длина (мм)")
@@ -81,11 +151,29 @@ class Product(models.Model):
     
     objects = models.Manager()
     all_objects = models.Manager()
+    
+    def get_default_price(self):
+        """Возвращает цену по умолчанию"""
+        default = self.prices.filter(is_default=True).first()
+        if default:
+            return default
+        return self.prices.first()
+    
+    def get_price_display(self):
+        """Возвращает строку с ценами для отображения"""
+        prices = []
+        for price in self.prices.all():
+            if price.unit_type.code == 'pack' and price.quantity_per_unit:
+                prices.append(f"{price.price} руб./{price.unit_type.short_name} ({price.quantity_per_unit} шт)")
+            else:
+                prices.append(f"{price.price} руб./{price.unit_type.short_name}")
+        return " | ".join(prices)
 
 
-# Модель изображения товара
+# Модель изображения товара (без изменений)
 class ProductImage(models.Model):
-    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='images', verbose_name="Товар")
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, 
+                               related_name='images', verbose_name="Товар")
     image_url = models.URLField(verbose_name="Ссылка на изображение")
 
     def __str__(self):
@@ -96,9 +184,10 @@ class ProductImage(models.Model):
         verbose_name_plural = "Изображения товаров"
 
 
-# Модель корзины (для авторизованных)
+# Модель корзины (ОБНОВЛЕННАЯ)
 class Cart(models.Model):
-    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='cart', verbose_name="Пользователь")
+    user = models.OneToOneField(User, on_delete=models.CASCADE, 
+                               related_name='cart', verbose_name="Пользователь")
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
     updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
 
@@ -110,18 +199,34 @@ class Cart(models.Model):
         verbose_name_plural = "Корзины"
 
 
-# Модель элемента корзины
+# Модель элемента корзины (ОБНОВЛЕННАЯ)
 class CartItem(models.Model):
-    cart = models.ForeignKey(Cart, on_delete=models.CASCADE, related_name='items', verbose_name="Корзина")
+    cart = models.ForeignKey(Cart, on_delete=models.CASCADE, 
+                            related_name='items', verbose_name="Корзина")
     product = models.ForeignKey(Product, on_delete=models.CASCADE, verbose_name="Товар")
+    
+    # ВАЖНО: Это поле должно быть обязательным и правильно именованным
+    selected_price = models.ForeignKey(
+        ProductPrice, 
+        on_delete=models.PROTECT, 
+        verbose_name="Выбранный вариант цены",
+        related_name='cart_items'
+    )
+    
     quantity = models.PositiveIntegerField(default=1, verbose_name="Количество")
 
     def __str__(self):
-        return f"{self.quantity} x {self.product.name} в корзине {self.cart.id}"
+        unit = self.selected_price.unit_type.short_name if self.selected_price else "шт"
+        return f"{self.quantity} {unit} x {self.product.name}"
 
     class Meta:
         verbose_name = "Элемент корзины"
         verbose_name_plural = "Элементы корзины"
+    
+    @property
+    def total_price(self):
+        """Общая стоимость позиции"""
+        return self.selected_price.price * self.quantity
 
 
 # Модель заказа (ОБНОВЛЕННАЯ)
@@ -133,7 +238,6 @@ class Order(models.Model):
         ('canceled', 'Отменен'),
     ]
     
-    # ОБНОВЛЕНО: user теперь необязательный
     user = models.ForeignKey(
         User, 
         on_delete=models.CASCADE, 
@@ -143,49 +247,21 @@ class Order(models.Model):
         blank=True
     )
     
-    total_price = models.DecimalField(
-        max_digits=10, 
-        decimal_places=2,
-        validators=[MinValueValidator(Decimal('0.00'))],
-        null=False,
-        blank=False
+    total_price = models.IntegerField(
+        validators=[MinValueValidator(0)],
+        verbose_name="Общая сумма (руб)"
     )
     address = models.TextField(verbose_name="Адрес доставки")
-    phone_number = models.CharField(max_length=15, blank=True, null=True, verbose_name="Номер телефона")
-
+    phone_number = models.CharField(max_length=15, blank=True, null=True, 
+                                   verbose_name="Номер телефона")
+    comment = models.TextField(verbose_name="Комментарий к заказу", blank=True, null=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, 
+                             default='in_process', verbose_name="Статус заказа")
     
-    # НОВОЕ: комментарий к заказу
-    comment = models.TextField(
-        verbose_name="Комментарий к заказу",
-        blank=True,
-        null=True,
-        help_text="Дополнительная информация по заказу"
-    )
-    
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='in_process', verbose_name="Статус заказа")
-    
-    
-    # НОВЫЕ ПОЛЯ для гостей
-    guest_email = models.EmailField(
-        verbose_name="Email гостя",
-        max_length=254,
-        blank=True,
-        null=True
-    )
-    guest_name = models.CharField(
-        verbose_name="Имя гостя",
-        max_length=150,
-        blank=True,
-        null=True
-    )
-    
-    # Сессия для идентификации гостя
-    session_key = models.CharField(
-        max_length=40,
-        blank=True,
-        null=True,
-        db_index=True
-    )
+    # Поля для гостей
+    guest_email = models.EmailField(verbose_name="Email гостя", max_length=254, blank=True, null=True)
+    guest_name = models.CharField(verbose_name="Имя гостя", max_length=150, blank=True, null=True)
+    session_key = models.CharField(max_length=40, blank=True, null=True, db_index=True)
     
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
     updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
@@ -200,12 +276,28 @@ class Order(models.Model):
         verbose_name_plural = "Заказы"
 
 
-# Модель элемента заказа
+# Модель элемента заказа (ОБНОВЛЕННАЯ)
 class OrderItem(models.Model):
-    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='items', verbose_name="Заказ")
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, 
+                             related_name='items', verbose_name="Заказ")
     product = models.ForeignKey(Product, on_delete=models.CASCADE, verbose_name="Товар")
+    
+    # НОВОЕ: Сохраняем информацию о выбранной цене
+    selected_price_info = models.JSONField(
+        verbose_name="Информация о цене",
+        help_text="Сохраненная информация о цене на момент заказа",
+        default=dict
+    )
+    
     quantity = models.PositiveIntegerField(verbose_name="Количество")
-    price = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0)], verbose_name="Цена")
+    
+    # Цена за единицу на момент заказа (целое число)
+    price_per_unit = models.IntegerField(
+        validators=[MinValueValidator(0)],
+        verbose_name="Цена за единицу"
+    )
+    
+    unit_type = models.CharField(max_length=20, verbose_name="Тип единицы", default='piece')
 
     def __str__(self):
         return f"{self.quantity} x {self.product.name} в заказе {self.order.id}"
@@ -213,16 +305,8 @@ class OrderItem(models.Model):
     class Meta:
         verbose_name = "Элемент заказа"
         verbose_name_plural = "Элементы заказа"
-
-
-# Модель рекомендации
-class Recommendation(models.Model):
-    question = models.CharField(max_length=255, verbose_name="Вопрос")
-    answer = models.TextField(verbose_name="Ответ")
-
-    def __str__(self):
-        return self.question
-
-    class Meta:
-        verbose_name = "Рекомендация"
-        verbose_name_plural = "Рекомендации"
+    
+    @property
+    def total_price(self):
+        """Общая стоимость позиции"""
+        return self.price_per_unit * self.quantity

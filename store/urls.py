@@ -4,7 +4,7 @@ from .views import (
     CategoryViewSet, ProductViewSet, ProductImageViewSet, 
     WoodTypeViewSet, GradeViewSet, CartViewSet, CartItemViewSet, 
     OrderViewSet, OrderItemViewSet,
-    TelegramNotificationView  # Импортируем КЛАСС
+    TelegramNotificationView, UnitTypeViewSet, ProductPriceViewSet, DebugAuthView    # Импортируем КЛАСС
 )
 
 router = DefaultRouter()
@@ -17,9 +17,15 @@ router.register(r'carts', CartViewSet)
 router.register(r'cartitems', CartItemViewSet)
 router.register(r'orders', OrderViewSet, basename='order')
 router.register(r'orderitems', OrderItemViewSet)
+router.register(r'unit-types', UnitTypeViewSet)  # Новый
+router.register(r'product-prices', ProductPriceViewSet)  # Новый
 
 urlpatterns = [
     path('', include(router.urls)), 
+
+    # store/urls.py - добавьте этот путь
+    path('api/debug-auth/', DebugAuthView.as_view(), name='debug-auth'),
+
     # ИСПРАВЛЕНО: используем as_view() для класса
     path('telegram-notification/', TelegramNotificationView.as_view(), name='telegram-notification'),
 ]

@@ -14,12 +14,16 @@ from django.db.models import Q
 from django.conf import settings
 import telegram
 import logging
+import requests
+import threading
+from rest_framework_simplejwt.authentication import JWTAuthentication
 
-from .models import Category, Product, ProductImage, WoodType, Grade, Cart, CartItem, Order, OrderItem
+
+from .models import Category, Product, ProductImage, WoodType, Grade, Cart, CartItem, Order, OrderItem, UnitType, ProductPrice
 from .serializers import (
     CategorySerializer, ProductSerializer, ProductImageSerializer,
     WoodTypeSerializer, GradeSerializer, CartSerializer, CartItemSerializer,
-    OrderSerializer, OrderItemSerializer, UserSerializer
+    OrderSerializer, OrderItemSerializer, UserSerializer, UnitTypeSerializer, ProductPriceSerializer
 )
 
 User = get_user_model()
@@ -51,6 +55,29 @@ class GradeViewSet(viewsets.ModelViewSet):
     queryset = Grade.objects.all()
     serializer_class = GradeSerializer
     permission_classes = [AllowAny]
+
+class UnitTypeViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet для типов единиц измерения
+    """
+    queryset = UnitType.objects.all()
+    serializer_class = UnitTypeSerializer
+    permission_classes = [AllowAny]
+    
+class ProductPriceViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet для цен товаров
+    """
+    queryset = ProductPrice.objects.all()
+    serializer_class = ProductPriceSerializer
+    permission_classes = [AllowAny]
+    
+    def get_queryset(self):
+        queryset = ProductPrice.objects.all()
+        product_id = self.request.query_params.get('product', None)
+        if product_id:
+            queryset = queryset.filter(product_id=product_id)
+        return queryset
 
 class ProductFilter(django_filters.FilterSet):
     min_price = django_filters.NumberFilter(field_name="price", lookup_expr='gte')
@@ -119,6 +146,7 @@ class ProductImageViewSet(viewsets.ModelViewSet):
 
 
 # ========== КОРЗИНА ==========
+# ОБНОВЛЕННЫЙ CartViewSet (метод add_to_cart)
 class CartViewSet(viewsets.ModelViewSet):
     queryset = Cart.objects.all()
     serializer_class = CartSerializer
@@ -133,6 +161,55 @@ class CartViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(cart)
         return Response(serializer.data)
 
+    @action(detail=False, methods=['post'])
+    def add_to_cart(self, request):
+        user = request.user
+        product_id = request.data.get('product_id')
+        quantity = int(request.data.get('quantity', 1))
+        selected_price_id = request.data.get('selected_price_id')
+
+        if not product_id:
+            return Response({'error': 'product_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+        if not selected_price_id:
+            return Response({'error': 'selected_price_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+        if quantity <= 0:
+            return Response({'error': 'Количество должно быть больше 0'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            product = Product.objects.get(id=product_id, is_active=True)
+            selected_price = ProductPrice.objects.get(id=selected_price_id, product_id=product_id)
+        except Product.DoesNotExist:
+            return Response({'error': 'Товар не найден'}, status=status.HTTP_404_NOT_FOUND)
+        except ProductPrice.DoesNotExist:
+            return Response({'error': 'Выбранный вариант цены не найден'}, status=status.HTTP_404_NOT_FOUND)
+
+        cart, created = Cart.objects.get_or_create(user=user)
+
+        # Ищем существующий item с таким же товаром и ценой
+        cart_item = CartItem.objects.filter(
+            cart=cart,
+            product=product,
+            selected_price=selected_price
+        ).first()
+
+        if cart_item:
+            # Обновляем количество, если оно изменилось
+            if cart_item.quantity != quantity:
+                cart_item.quantity = quantity
+                cart_item.save()
+                return Response({'status': 'Количество товара обновлено'}, status=status.HTTP_200_OK)
+            else:
+                return Response({'status': 'Товар уже в корзине в нужном количестве'}, status=status.HTTP_200_OK)
+        else:
+            cart_item = CartItem(
+                cart=cart,
+                product=product,
+                selected_price=selected_price,
+                quantity=quantity
+            )
+            cart_item.save()
+            return Response({'status': 'Товар добавлен в корзину'}, status=status.HTTP_200_OK)
+
     @action(detail=False, methods=['delete'])
     def clear(self, request):
         try:
@@ -141,34 +218,6 @@ class CartViewSet(viewsets.ModelViewSet):
             return Response({'status': 'Корзина очищена'}, status=status.HTTP_200_OK)
         except Cart.DoesNotExist:
             return Response({'error': 'Корзина не найдена'}, status=status.HTTP_404_NOT_FOUND)
-
-    @action(detail=False, methods=['post'])
-    def add_to_cart(self, request):
-        user = request.user
-        product_id = request.data.get('product_id')
-        quantity = int(request.data.get('quantity', 1))
-
-        if not product_id:
-            return Response({'error': 'product_id is required'}, status=status.HTTP_400_BAD_REQUEST)
-        
-        if quantity <= 0:
-            return Response({'error': 'Количество должно быть больше 0'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            product = Product.objects.get(id=product_id, is_active=True)
-        except Product.DoesNotExist:
-            return Response({'error': 'Товар не найден'}, status=status.HTTP_404_NOT_FOUND)
-
-        cart, created = Cart.objects.get_or_create(user=user)
-        cart_item, created = CartItem.objects.get_or_create(cart=cart, product=product)
-
-        if not created:
-            cart_item.quantity += quantity
-        else:
-            cart_item.quantity = quantity
-
-        cart_item.save()
-        return Response({'status': 'Товар добавлен в корзину'}, status=status.HTTP_200_OK)
 
 class CartItemViewSet(viewsets.ModelViewSet):
     queryset = CartItem.objects.all()
@@ -195,19 +244,55 @@ class OrderFilter(django_filters.FilterSet):
             Q(guest_email__icontains=value)
         )
 
-import asyncio
 
-def send_telegram_notification(order):
+# store/views.py - обновленная функция send_telegram_notification
+
+def send_telegram_notification_async(order_id):
+    """Отправка уведомления в Telegram в отдельном потоке"""
     try:
-        # Создаем новый event loop
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        from .models import Order
+        order = Order.objects.prefetch_related('items__product').get(id=order_id)
         
-        bot = telegram.Bot(token=settings.TELEGRAM_BOT_TOKEN)
+        url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
+        
+        # Функция для получения красивого названия единицы измерения
+        def get_unit_display(item):
+            # Сначала проверяем selected_price_info
+            if item.selected_price_info:
+                unit_short = item.selected_price_info.get('unit_type_short')
+                if unit_short:
+                    return unit_short
+            
+            # Если нет, используем маппинг
+            unit_map = {
+                'piece': 'шт',
+                'cubic': 'м³',
+                'square': 'м²',
+                'pack': 'уп',
+                'linear': 'п.м'
+            }
+            return unit_map.get(item.unit_type, item.unit_type or 'шт')
+        
+        # Функция для форматирования количества
+        def get_quantity_display(item):
+            quantity = item.quantity
+            unit = get_unit_display(item)
+            
+            # Для упаковок показываем дополнительную информацию
+            if item.selected_price_info and item.selected_price_info.get('unit_type_code') == 'pack':
+                quantity_per_unit = item.selected_price_info.get('quantity_per_unit')
+                if quantity_per_unit:
+                    total_items = quantity * quantity_per_unit
+                    return f"{quantity} уп ({total_items} шт)"
+            
+            return f"{quantity} {unit}"
         
         items_list = ""
         for item in order.items.all():
-            items_list += f"\n• {item.product.name} - {item.quantity} шт. x {item.price} руб. = {item.quantity * item.price} руб."
+            quantity_display = get_quantity_display(item)
+            unit_display = get_unit_display(item)
+            
+            items_list += f"\n• {item.product.name} - {quantity_display} × {item.price_per_unit} руб. = {item.quantity * item.price_per_unit} руб."
         
         client_info = f"👤 Клиент: {order.user.username if order.user else order.guest_name or 'Гость'}"
         if order.guest_email:
@@ -227,23 +312,33 @@ def send_telegram_notification(order):
 🛒 <b>Товары:</b>{items_list}
 """
         
-        # Запускаем асинхронную функцию
-        loop.run_until_complete(
-            bot.send_message(
-                chat_id=settings.TELEGRAM_ADMIN_CHAT_ID,
-                text=message,
-                parse_mode='HTML'
-            )
-        )
+        payload = {
+            "chat_id": settings.TELEGRAM_ADMIN_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        
+        # Здесь уже можно ждать, т.к. это отдельный поток
+        response = requests.post(url, json=payload, timeout=10)
+        response.raise_for_status()
         
         logger.info(f"✅ Telegram notification sent for order #{order.id}")
-        return True
         
     except Exception as e:
-        logger.error(f"❌ Failed to send Telegram notification: {e}")
+        logger.error(f"❌ Failed to send Telegram notification for order #{order_id}: {e}")
+
+def send_telegram_notification(order):
+    """Запускает отправку в отдельном потоке и сразу возвращает управление"""
+    try:
+        thread = threading.Thread(target=send_telegram_notification_async, args=(order.id,))
+        thread.daemon = True  # Поток завершится при завершении основного процесса
+        thread.start()
+        logger.info(f"📨 Telegram notification started for order #{order.id}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Failed to start telegram thread: {e}")
         return False
-    finally:
-        loop.close()
+
 
 class OrderViewSet(viewsets.ModelViewSet):
     queryset = Order.objects.none()
@@ -254,7 +349,7 @@ class OrderViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        
+
         if user.is_authenticated:
             queryset = Order.objects.filter(user=user)
         else:
@@ -263,10 +358,10 @@ class OrderViewSet(viewsets.ModelViewSet):
                 queryset = Order.objects.filter(session_key=session_key)
             else:
                 queryset = Order.objects.none()
-        
+
         if user.is_staff:
             queryset = Order.objects.all()
-        
+
         return queryset.select_related('user').prefetch_related(
             'items', 'items__product', 'items__product__images'
         ).order_by('-created_at')
@@ -280,7 +375,7 @@ class OrderViewSet(viewsets.ModelViewSet):
                         {'error': 'Поле address (адрес доставки) обязательно для заполнения'},
                         status=status.HTTP_400_BAD_REQUEST
                     )
-                
+
                 if not request.data.get('phone_number'):
                     return Response(
                         {'error': 'Поле phone_number (номер телефона) обязательно для заполнения'},
@@ -289,24 +384,31 @@ class OrderViewSet(viewsets.ModelViewSet):
 
                 # Для авторизованных пользователей
                 if request.user.is_authenticated:
-                    cart = Cart.objects.select_related('user').prefetch_related('items__product').get(user=request.user)
-                    
+                    cart = Cart.objects.select_related('user').prefetch_related('items__product', 'items__selected_price').get(user=request.user)
+
                     if not cart.items.exists():
                         return Response(
-                            {'error': 'Ваша корзина пуста'}, 
+                            {'error': 'Ваша корзина пуста'},
                             status=status.HTTP_400_BAD_REQUEST
                         )
 
                     total_price = Decimal('0.00')
                     order_items_data = []
-                    
+
                     for cart_item in cart.items.all():
-                        item_price = Decimal(str(cart_item.product.price))
-                        total_price += item_price * cart_item.quantity
+                        item_price = cart_item.selected_price.price
+                        total_price += Decimal(str(item_price)) * cart_item.quantity
                         order_items_data.append({
                             'product': cart_item.product,
                             'quantity': cart_item.quantity,
-                            'price': item_price
+                            'price_per_unit': item_price,
+                            'selected_price_info': {
+                                'id': cart_item.selected_price.id,
+                                'price': cart_item.selected_price.price,
+                                'unit_type': cart_item.selected_price.unit_type.code,
+                                'unit_type_short': cart_item.selected_price.unit_type.short_name,
+                                'quantity_per_unit': cart_item.selected_price.quantity_per_unit
+                            }
                         })
 
                     # Создание заказа для авторизованного - только нужные поля
@@ -324,40 +426,48 @@ class OrderViewSet(viewsets.ModelViewSet):
                     # Получаем или создаем session_key
                     if not request.session.session_key:
                         request.session.create()
-                    
+
                     session_key = request.session.session_key
 
                     # Получаем товары из корзины
                     cart_items = request.data.get('cart_items', [])
-                    
+
                     if not cart_items:
                         return Response(
-                            {'error': 'Корзина пуста'}, 
+                            {'error': 'Корзина пуста'},
                             status=status.HTTP_400_BAD_REQUEST
                         )
 
                     total_price = Decimal('0.00')
                     order_items_data = []
-                    
+
                     for item in cart_items:
                         try:
                             product = Product.objects.get(id=item['product_id'], is_active=True)
                             quantity = int(item['quantity'])
-                            
+
                             if quantity <= 0:
                                 raise ValueError("Количество должно быть положительным")
-                            
-                            item_price = Decimal(str(product.price))
-                            total_price += item_price * quantity
-                            
+
+                            selected_price = ProductPrice.objects.get(id=item['selected_price_id'])
+                            item_price = selected_price.price
+                            total_price += Decimal(str(item_price)) * quantity
+
                             order_items_data.append({
                                 'product': product,
                                 'quantity': quantity,
-                                'price': item_price
+                                'price_per_unit': item_price,
+                                'selected_price_info': {
+                                    'id': selected_price.id,
+                                    'price': selected_price.price,
+                                    'unit_type': selected_price.unit_type.code,
+                                    'unit_type_short': selected_price.unit_type.short_name,
+                                    'quantity_per_unit': selected_price.quantity_per_unit
+                                }
                             })
-                        except (Product.DoesNotExist, ValueError, KeyError) as e:
+                        except (Product.DoesNotExist, ProductPrice.DoesNotExist, ValueError, KeyError) as e:
                             return Response(
-                                {'error': f'Ошибка в данных корзины: {str(e)}'}, 
+                                {'error': f'Ошибка в данных корзины: {str(e)}'},
                                 status=status.HTTP_400_BAD_REQUEST
                             )
 
@@ -379,27 +489,25 @@ class OrderViewSet(viewsets.ModelViewSet):
                         order=order,
                         product=item['product'],
                         quantity=item['quantity'],
-                        price=item['price']
+                        price_per_unit=item['price_per_unit'],
+                        selected_price_info=item['selected_price_info'],
+                        unit_type=item['selected_price_info'].get('unit_type_code', 'piece')
                     ) for item in order_items_data
                 ])
 
-                # Отправляем уведомление в Telegram
-                try:
-                    order_with_items = Order.objects.prefetch_related('items__product').get(id=order.id)
-                    send_telegram_notification(order_with_items)
-                except Exception as e:
-                    logger.error(f"Failed to send Telegram notification for order #{order.id}: {e}")
+                # Отправляем уведомление в Telegram (теперь это быстро)
+                send_telegram_notification(order)  # Новая версия не блокирует выполнение
 
                 # Очищаем корзину для авторизованных
                 if request.user.is_authenticated:
                     cart.items.all().delete()
-                
+
                 serializer = self.get_serializer(order)
                 return Response(serializer.data, status=status.HTTP_201_CREATED)
 
         except Cart.DoesNotExist:
             return Response(
-                {'error': 'Корзина не найдена'}, 
+                {'error': 'Корзина не найдена'},
                 status=status.HTTP_404_NOT_FOUND
             )
         except Exception as e:
@@ -408,6 +516,10 @@ class OrderViewSet(viewsets.ModelViewSet):
                 {'error': f'Ошибка при создании заказа: {str(e)}'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+
+
+    
 
     def update(self, request, *args, **kwargs):
         partial = kwargs.pop('partial', False)
@@ -531,6 +643,7 @@ class RegisterView(APIView):
             'linked_orders_count': linked_orders_count
         }, status=status.HTTP_201_CREATED)
 
+# store/views.py - исправленный LoginView
 class LoginView(APIView):
     permission_classes = [AllowAny]
     
@@ -550,7 +663,18 @@ class LoginView(APIView):
             refresh = RefreshToken.for_user(user)
             
             # Создаем корзину если её нет
-            Cart.objects.get_or_create(user=user)
+            cart, created = Cart.objects.get_or_create(user=user)
+            
+            # Получаем сессию из запроса (для гостевых заказов)
+            session_key = request.session.session_key
+            
+            # Привязываем гостевые заказы к пользователю
+            if session_key:
+                guest_orders = Order.objects.filter(session_key=session_key)
+                for order in guest_orders:
+                    order.user = user
+                    order.session_key = None
+                    order.save()
             
             return Response({
                 'message': 'Успешный вход',
@@ -558,7 +682,8 @@ class LoginView(APIView):
                     'refresh': str(refresh),
                     'access': str(refresh.access_token),
                 },
-                'user': UserSerializer(user).data
+                'user': UserSerializer(user).data,
+                'session_key': session_key  # Возвращаем сессию для синхронизации
             }, status=status.HTTP_200_OK)
             
         return Response(
@@ -595,3 +720,28 @@ class TelegramNotificationView(APIView):
                 {'error': str(e)}, 
                 status=status.HTTP_400_BAD_REQUEST
             )
+        
+
+# store/views.py - добавьте в конец файла
+
+class DebugAuthView(APIView):
+    """
+    Тестовый эндпоинт для проверки аутентификации
+    """
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+    
+    def get(self, request):
+        print("\n" + "="*50)
+        print("🔍 DEBUG AUTH ENDPOINT")
+        print(f"User: {request.user}")
+        print(f"Is authenticated: {request.user.is_authenticated}")
+        print(f"Auth header: {request.headers.get('Authorization', 'Not provided')}")
+        print("="*50 + "\n")
+        
+        return Response({
+            'message': 'Аутентификация работает!',
+            'user': request.user.username,
+            'user_id': request.user.id,
+            'is_authenticated': request.user.is_authenticated,
+        })
