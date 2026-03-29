@@ -17,6 +17,8 @@ import logging
 import requests
 import threading
 from rest_framework_simplejwt.authentication import JWTAuthentication
+from django.db.models import OuterRef, Subquery, F
+from django.db.models.functions import Coalesce
 
 
 from .models import Category, Product, ProductImage, WoodType, Grade, Cart, CartItem, Order, OrderItem, UnitType, ProductPrice
@@ -79,9 +81,13 @@ class ProductPriceViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(product_id=product_id)
         return queryset
 
+# store/views.py - замените существующий ProductFilter на этот
+
 class ProductFilter(django_filters.FilterSet):
-    min_price = django_filters.NumberFilter(field_name="price", lookup_expr='gte')
-    max_price = django_filters.NumberFilter(field_name="price", lookup_expr='lte')
+    # Фильтр по цене через связанную модель ProductPrice
+    min_price = django_filters.NumberFilter(method='filter_min_price')
+    max_price = django_filters.NumberFilter(method='filter_max_price')
+    
     category = django_filters.NumberFilter(field_name="category__id")
     wood_type = django_filters.CharFilter(field_name="wood_type__name")
     grade = django_filters.CharFilter(field_name="grade__name")
@@ -89,27 +95,116 @@ class ProductFilter(django_filters.FilterSet):
     thickness = django_filters.NumberFilter(field_name="thickness")
     length = django_filters.NumberFilter(field_name="length")
     search = django_filters.CharFilter(method='filter_search')
+    
+    # НОВАЯ СТРУКТУРА ДЛЯ СОРТИРОВКИ - используем аннотированное поле с ценой по умолчанию
     ordering = django_filters.OrderingFilter(
         fields=(
             ('name', 'name'),
-            ('price', 'price'),
-        )
+            ('default_price', 'price'),  # Используем аннотированное поле default_price
+        ),
+        distinct=False  # Убираем distinct, так как теперь у нас нет дублей
     )
+    
     is_active = django_filters.BooleanFilter(field_name='is_active', initial=True)
 
     class Meta:
         model = Product
-        fields = ['category', 'wood_type', 'grade', 'width', 'thickness', 'length', 'min_price', 'max_price', 'is_active']
+        fields = ['category', 'wood_type', 'grade', 'width', 'thickness', 'length', 'is_active']
+
+    def filter_min_price(self, queryset, name, value):
+        """Фильтр по минимальной цене - используем цену по умолчанию или первую цену"""
+        if value is not None:
+            # Сначала аннотируем товары их ценами по умолчанию
+            default_price_subquery = ProductPrice.objects.filter(
+                product=OuterRef('pk')
+            ).order_by('-is_default', 'id')[:1]
+            
+            queryset = queryset.annotate(
+                default_price=Subquery(default_price_subquery.values('price')[:1])
+            )
+            
+            return queryset.filter(default_price__gte=value)
+        return queryset
+
+    def filter_max_price(self, queryset, name, value):
+        """Фильтр по максимальной цене - используем цену по умолчанию или первую цену"""
+        if value is not None:
+            # Сначала аннотируем товары их ценами по умолчанию
+            default_price_subquery = ProductPrice.objects.filter(
+                product=OuterRef('pk')
+            ).order_by('-is_default', 'id')[:1]
+            
+            queryset = queryset.annotate(
+                default_price=Subquery(default_price_subquery.values('price')[:1])
+            )
+            
+            return queryset.filter(default_price__lte=value)
+        return queryset
 
     def filter_search(self, queryset, name, value):
+        """Поиск по названию"""
         return queryset.filter(name__icontains=value)
+    
+    def get_queryset(self):
+        """Переопределяем get_queryset, чтобы аннотировать все товары ценой по умолчанию"""
+        queryset = super().get_queryset()
+        
+        # Аннотируем все товары их ценой по умолчанию
+        default_price_subquery = ProductPrice.objects.filter(
+            product=OuterRef('pk')
+        ).order_by('-is_default', 'id')[:1]
+        
+        return queryset.annotate(
+            default_price=Subquery(default_price_subquery.values('price')[:1])
+        )
 
+# store/views.py - замените существующий ProductViewSet на этот
+
+# store/views.py
 class ProductViewSet(viewsets.ModelViewSet):
     queryset = Product.objects.all()
     serializer_class = ProductSerializer
     filter_backends = [django_filters.DjangoFilterBackend]
     filterset_class = ProductFilter
     permission_classes = [AllowAny]
+
+    def get_queryset(self):
+        """Оптимизируем запросы и добавляем аннотацию с ценой по умолчанию"""
+        from django.db.models import OuterRef, Subquery
+        
+        # Подзапрос для получения цены по умолчанию
+        default_price_subquery = ProductPrice.objects.filter(
+            product=OuterRef('pk')
+        ).order_by('-is_default', 'id')[:1]
+        
+        queryset = Product.objects.filter(is_active=True).prefetch_related(
+            'prices',
+            'prices__unit_type',
+            'images'
+        ).annotate(
+            default_price=Subquery(default_price_subquery.values('price')[:1])
+        )
+        
+        # Поддержка category__in для родительских категорий
+        category_in = self.request.query_params.get('category__in')
+        if category_in:
+            category_ids = [int(id) for id in category_in.split(',') if id.strip().isdigit()]
+            if category_ids:
+                queryset = queryset.filter(category__id__in=category_ids)
+        
+        # Обработка сортировки по цене
+        ordering = self.request.query_params.get('ordering')
+        if ordering and 'price' in ordering:
+            # Преобразуем 'price' в 'default_price' для сортировки
+            if ordering == 'price':
+                queryset = queryset.order_by('default_price')
+            elif ordering == '-price':
+                queryset = queryset.order_by('-default_price')
+            else:
+                # Для других видов сортировки
+                queryset = queryset.order_by(ordering)
+        
+        return queryset
 
     def destroy(self, request, *args, **kwargs):
         product = self.get_object()
