@@ -17,7 +17,7 @@ class UserSerializer(serializers.ModelSerializer):
 class CategorySerializer(serializers.ModelSerializer):
     class Meta:
         model = Category
-        fields = ['id', 'name', 'image_url', 'parent']
+        fields = ['id', 'name', 'slug', 'image_url', 'parent']
 
 class WoodTypeSerializer(serializers.ModelSerializer):
     class Meta:
@@ -90,7 +90,7 @@ class ProductSerializer(serializers.ModelSerializer):
     class Meta:
         model = Product
         fields = [
-            'id', 'name', 'description', 'is_active',
+            'id', 'name', 'slug', 'description', 'is_active',
             'category', 'wood_type', 'grade',
             'width', 'thickness', 'length',
             'prices', 'display_prices', 'prices_data',

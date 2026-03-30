@@ -3,6 +3,7 @@ from django.db import models
 from django.contrib.auth.models import AbstractUser
 from django.core.validators import MinValueValidator
 from django.core.exceptions import ValidationError
+from django.utils.text import slugify
 
 
 # Модель пользователя (без изменений)
@@ -22,6 +23,12 @@ class Category(models.Model):
     name = models.CharField(max_length=100)
     image_url = models.URLField(blank=True, null=True)
     parent = models.ForeignKey('self', on_delete=models.CASCADE, null=True, blank=True, related_name='children')
+    slug = models.SlugField(unique=True, blank=True, null=True, max_length=100)
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = slugify(self.name)
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return self.name
@@ -123,6 +130,7 @@ class ProductPrice(models.Model):
 class Product(models.Model):
     name = models.CharField(max_length=255, db_index=True, verbose_name="Название товара")
     description = models.TextField(db_index=True, verbose_name="Описание")
+    slug = models.SlugField(unique=True, blank=True, null=True, max_length=255)
     
     # Удаляем старое поле price - теперь цены в ProductPrice
     
@@ -141,6 +149,11 @@ class Product(models.Model):
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
     updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
     is_active = models.BooleanField(default=True, verbose_name="Активный")
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = slugify(self.name)
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return self.name
