@@ -233,6 +233,21 @@ class ProductViewSet(viewsets.ModelViewSet):
         product.save()
         serializer = self.get_serializer(product)
         return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'], url_path='by-slug/(?P<slug>[^/.]+)')
+    def get_by_slug(self, request, slug=None):
+        """
+        Получить товар по slug
+        """
+        try:
+            product = Product.objects.get(slug=slug, is_active=True)
+            serializer = self.get_serializer(product)
+            return Response(serializer.data)
+        except Product.DoesNotExist:
+            return Response(
+                {'error': 'Product not found'}, 
+                status=status.HTTP_404_NOT_FOUND
+            )
 
 class ProductImageViewSet(viewsets.ModelViewSet):
     queryset = ProductImage.objects.all()
