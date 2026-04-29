@@ -265,3 +265,12 @@ SIMPLE_JWT = {
     'USER_ID_FIELD': 'id',
     'USER_ID_CLAIM': 'user_id',
 }
+
+# Email settings
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = 'smtp.yandex.ru'  # или ваш SMTP сервер
+EMAIL_PORT = 465
+EMAIL_USE_SSL = True
+EMAIL_HOST_USER = 'prime-forest@yandex.ru'
+EMAIL_HOST_PASSWORD = 'nmwvmkevsrebbkro'
+DEFAULT_FROM_EMAIL = 'prime-forest@yandex.ru'

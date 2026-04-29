@@ -1,4 +1,5 @@
 # store/views.py
+import re  # Добавьте эту строку
 from decimal import Decimal
 from django.db import transaction
 from rest_framework import viewsets, status
@@ -19,6 +20,8 @@ import threading
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from django.db.models import OuterRef, Subquery, F
 from django.db.models.functions import Coalesce
+from django.core.mail import send_mail
+from datetime import datetime
 
 
 from .models import Category, Product, ProductImage, WoodType, Grade, Cart, CartItem, Order, OrderItem, UnitType, ProductPrice
@@ -479,7 +482,6 @@ class OrderViewSet(viewsets.ModelViewSet):
     def create(self, request, *args, **kwargs):
         try:
             with transaction.atomic():
-                # Проверяем только обязательные поля
                 if not request.data.get('address'):
                     return Response(
                         {'error': 'Поле address (адрес доставки) обязательно для заполнения'},
@@ -492,7 +494,6 @@ class OrderViewSet(viewsets.ModelViewSet):
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-                # Для авторизованных пользователей
                 if request.user.is_authenticated:
                     cart = Cart.objects.select_related('user').prefetch_related('items__product', 'items__selected_price').get(user=request.user)
 
@@ -521,7 +522,6 @@ class OrderViewSet(viewsets.ModelViewSet):
                             }
                         })
 
-                    # Создание заказа для авторизованного - только нужные поля
                     order = Order.objects.create(
                         user=request.user,
                         address=request.data.get('address'),
@@ -531,15 +531,11 @@ class OrderViewSet(viewsets.ModelViewSet):
                         total_price=total_price
                     )
 
-                # Для гостей
                 else:
-                    # Получаем или создаем session_key
                     if not request.session.session_key:
                         request.session.create()
 
                     session_key = request.session.session_key
-
-                    # Получаем товары из корзины
                     cart_items = request.data.get('cart_items', [])
 
                     if not cart_items:
@@ -581,7 +577,6 @@ class OrderViewSet(viewsets.ModelViewSet):
                                 status=status.HTTP_400_BAD_REQUEST
                             )
 
-                    # Создание заказа для гостя - только нужные поля
                     order = Order.objects.create(
                         session_key=session_key,
                         guest_name=request.data.get('guest_name', 'Гость'),
@@ -601,12 +596,12 @@ class OrderViewSet(viewsets.ModelViewSet):
                         quantity=item['quantity'],
                         price_per_unit=item['price_per_unit'],
                         selected_price_info=item['selected_price_info'],
-                        unit_type=item['selected_price_info'].get('unit_type_code', 'piece')
+                        unit_type=item['selected_price_info'].get('unit_type', 'piece')
                     ) for item in order_items_data
                 ])
 
-                # Отправляем уведомление в Telegram (теперь это быстро)
-                send_telegram_notification(order)  # Новая версия не блокирует выполнение
+                # Отправляем уведомление на почту вместо Telegram
+                send_order_notification_to_email(order, order_items_data, request)
 
                 # Очищаем корзину для авторизованных
                 if request.user.is_authenticated:
@@ -855,3 +850,212 @@ class DebugAuthView(APIView):
             'user_id': request.user.id,
             'is_authenticated': request.user.is_authenticated,
         })
+    
+class CallbackRequestView(APIView):
+    """
+    Эндпоинт для заказа обратного звонка
+    """
+    permission_classes = [AllowAny]
+    
+    def post(self, request):
+        name = request.data.get('name', '').strip()
+        phone = request.data.get('phone', '').strip()
+        
+        # Валидация
+        if not name:
+            return Response({
+                'error': 'Пожалуйста, укажите ваше имя'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        if not phone:
+            return Response({
+                'error': 'Пожалуйста, укажите номер телефона'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Очистка телефона и проверка длины
+        phone_clean = re.sub(r'[\s\(\)-]+', '', phone)
+        if len(phone_clean) < 10:
+            return Response({
+                'error': 'Некорректный номер телефона'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Отправка email на prime-forest@yandex.ru
+        try:
+            subject = f'🔔 Заказ обратного звонка от {name}'
+            message = f"""
+            <html>
+            <head>
+                <style>
+                    body {{ font-family: Arial, sans-serif; }}
+                    .header {{ background-color: #2b5e2b; color: white; padding: 15px; text-align: center; }}
+                    .content {{ padding: 20px; }}
+                    .info-row {{ margin-bottom: 10px; }}
+                    .label {{ font-weight: bold; color: #2b5e2b; }}
+                </style>
+            </head>
+            <body>
+                <div class="header">
+                    <h2>📞 НОВАЯ ЗАЯВКА НА ОБРАТНЫЙ ЗВОНОК</h2>
+                </div>
+                <div class="content">
+                    <div class="info-row">
+                        <span class="label">👤 Имя:</span> {name}
+                    </div>
+                    <div class="info-row">
+                        <span class="label">📱 Телефон:</span> {phone}
+                    </div>
+                    <div class="info-row">
+                        <span class="label">⏰ Время заявки:</span> {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}
+                    </div>
+                </div>
+            </body>
+            </html>
+            """
+            
+            send_mail(
+                subject=subject,
+                message=message,
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=['prime-forest@yandex.ru'],
+                html_message=message,
+                fail_silently=False,
+            )
+            
+            logger.info(f"Callback request sent: {name}, {phone}")
+            
+            return Response({
+                'message': 'Заявка успешно отправлена',
+                'status': 'ok'
+            }, status=status.HTTP_200_OK)
+            
+        except Exception as e:
+            logger.error(f"Failed to send callback email: {e}")
+            return Response({
+                'error': 'Не удалось отправить заявку. Пожалуйста, попробуйте позже.'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+
+def send_order_notification_to_email(order, order_items_data, request):
+    """Отправка уведомления о новом заказе на почту prime-forest@yandex.ru"""
+    try:
+        # Формируем список товаров в HTML
+        items_html = ""
+        items_text = ""
+        
+        for item in order_items_data:
+            unit_short = item['selected_price_info'].get('unit_type_short', 'шт')
+            quantity = item['quantity']
+            price = item['price_per_unit']
+            total = quantity * price
+            
+            # Для упаковок показываем дополнительную информацию
+            pack_info = ""
+            if item['selected_price_info'].get('unit_type') == 'pack':
+                qty_per_unit = item['selected_price_info'].get('quantity_per_unit')
+                if qty_per_unit:
+                    pack_info = f" ({quantity * qty_per_unit} шт)"
+                    unit_short = "уп"
+            
+            items_html += f"""
+            <tr>
+                <td style="padding: 8px; border-bottom: 1px solid #ddd;">{item['product'].name}</td>
+                <td style="padding: 8px; border-bottom: 1px solid #ddd; text-align: center;">{quantity} {unit_short}{pack_info}</td>
+                <td style="padding: 8px; border-bottom: 1px solid #ddd; text-align: right;">₽{price:,}</td>
+                <td style="padding: 8px; border-bottom: 1px solid #ddd; text-align: right;">₽{total:,}</td>
+            </tr>
+            """
+            
+            items_text += f"\n• {item['product'].name} - {quantity} {unit_short} × {price} руб. = {total} руб."
+        
+        # Определяем имя клиента
+        if order.user:
+            client_name = order.user.username
+            client_email = order.user.email or "не указан"
+        else:
+            client_name = order.guest_name or "Гость"
+            client_email = order.guest_email or "не указан"
+        
+        # Формируем HTML письмо
+        html_message = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; }}
+                .header {{ background-color: #2b5e2b; color: white; padding: 15px; text-align: center; }}
+                .content {{ padding: 20px; }}
+                .info-section {{ background-color: #f5f5f5; padding: 15px; border-radius: 8px; margin-bottom: 20px; }}
+                .info-row {{ margin-bottom: 8px; }}
+                .label {{ font-weight: bold; color: #2b5e2b; }}
+                table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
+                th {{ background-color: #2b5e2b; color: white; padding: 10px; text-align: left; }}
+                .total {{ font-size: 18px; font-weight: bold; color: #2b5e2b; text-align: right; margin-top: 15px; }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h2>🆕 НОВЫЙ ЗАКАЗ #{order.id}</h2>
+            </div>
+            <div class="content">
+                <div class="info-section">
+                    <h3>👤 Информация о клиенте</h3>
+                    <div class="info-row"><span class="label">Имя:</span> {client_name}</div>
+                    <div class="info-row"><span class="label">📧 Email:</span> {client_email}</div>
+                    <div class="info-row"><span class="label">📞 Телефон:</span> {order.phone_number}</div>
+                    <div class="info-row"><span class="label">📍 Адрес:</span> {order.address}</div>
+                    {f'<div class="info-row"><span class="label">💬 Комментарий:</span> {order.comment}</div>' if order.comment else ''}
+                </div>
+                
+                <h3>🛒 Состав заказа</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Товар</th>
+                            <th style="text-align: center">Количество</th>
+                            <th style="text-align: right">Цена</th>
+                            <th style="text-align: right">Сумма</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {items_html}
+                    </tbody>
+                </table>
+                
+                <div class="total">
+                    💰 ИТОГО: ₽{order.total_price:,}
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        # Текстовая версия для plain text
+        text_message = f"""
+        НОВЫЙ ЗАКАЗ #{order.id}
+        
+        Информация о клиенте:
+        Имя: {client_name}
+        Email: {client_email}
+        Телефон: {order.phone_number}
+        Адрес: {order.address}
+        {f'Комментарий: {order.comment}' if order.comment else ''}
+        
+        Состав заказа:{items_text}
+        
+        ИТОГО: {order.total_price} руб.
+        """
+        
+        # Отправляем email
+        send_mail(
+            subject=f'🆕 Новый заказ #{order.id} от {client_name}',
+            message=text_message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=['prime-forest@yandex.ru'],
+            html_message=html_message,
+            fail_silently=False,
+        )
+        
+        logger.info(f"✅ Email notification sent for order #{order.id} to prime-forest@yandex.ru")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to send email notification for order #{order.id}: {e}")
